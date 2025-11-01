@@ -13,18 +13,21 @@ mod file_transfer;
 mod geth_downloader;
 mod headless;
 mod keystore;
-mod pool;
 mod manager;
+mod multi_source_download;
 pub mod net;
 mod peer_selection;
+mod pool;
+mod proxy_latency;
+
 mod webrtc_service;
 use std::sync::Mutex as StdMutex;
 
-use lazy_static::lazy_static;
 use crate::commands::proxy::{
-    list_proxies, proxy_connect, proxy_disconnect, proxy_echo, ProxyNode,
+    list_proxies, proxy_connect, proxy_disconnect, proxy_echo, proxy_remove, ProxyNode,
 };
-use dht::{DhtEvent, DhtMetricsSnapshot, DhtService, FileMetadata};
+use crate::commands::bootstrap::get_bootstrap_nodes_command;
+use dht::{DhtEvent, DhtMetricsSnapshot, DhtService, FileMetadata, split_into_blocks, StringBlock};
 use ethereum::{
     create_new_account, get_account_from_private_key, get_balance, get_block_number, get_hashrate,
     get_mined_blocks_count, get_mining_logs, get_mining_performance, get_mining_status,
@@ -35,9 +38,11 @@ use file_transfer::{DownloadMetricsSnapshot, FileTransferEvent, FileTransferServ
 use fs2::available_space;
 use geth_downloader::GethDownloader;
 use keystore::Keystore;
+use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::fs::File;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{
@@ -52,14 +57,16 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, State,
 };
-use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
+use tokio::{io::AsyncReadExt, sync::Mutex, task::JoinHandle, time::sleep};
 use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use webrtc_service::{WebRTCFileRequest, WebRTCService};
+use multi_source_download::{MultiSourceDownloadService, MultiSourceEvent, MultiSourceProgress};
 
 use crate::manager::ChunkManager; // Import the ChunkManager
-use x25519_dalek::{PublicKey, StaticSecret}; // For key handling
 use base64::{engine::general_purpose, Engine as _}; // For key encoding
+use blockstore::block::Block;
+use x25519_dalek::{PublicKey, StaticSecret}; // For key handling
 
 #[derive(Clone)]
 struct QueuedTransaction {
@@ -67,6 +74,17 @@ struct QueuedTransaction {
     to_address: String,
     amount: f64,
     timestamp: u64,
+}
+
+#[derive(Clone)]
+struct StreamingUploadSession {
+    file_name: String,
+    file_size: u64,
+    received_chunks: u32,
+    total_chunks: u32,
+    hasher: sha2::Sha256,
+    created_at: std::time::SystemTime,
+    chunk_cids: Vec<dht::Cid>, // Collect CIDs of all chunks for root block creation
 }
 
 struct AppState {
@@ -82,8 +100,11 @@ struct AppState {
     dht: Mutex<Option<Arc<DhtService>>>,
     file_transfer: Mutex<Option<Arc<FileTransferService>>>,
     webrtc: Mutex<Option<Arc<WebRTCService>>>,
+    multi_source_download: Mutex<Option<Arc<MultiSourceDownloadService>>>,
+    keystore: Arc<Mutex<Keystore>>,
     proxies: Arc<Mutex<Vec<ProxyNode>>>,
     file_transfer_pump: Mutex<Option<JoinHandle<()>>>,
+    multi_source_pump: Mutex<Option<JoinHandle<()>>>,
     socks5_proxy_cli: Mutex<Option<String>>,
     analytics: Arc<analytics::AnalyticsService>,
 
@@ -91,6 +112,9 @@ struct AppState {
     transaction_queue: Arc<Mutex<VecDeque<QueuedTransaction>>>,
     transaction_processor: Mutex<Option<JoinHandle<()>>>,
     processing_transaction: Arc<Mutex<bool>>,
+
+    // New field for streaming upload sessions
+    upload_sessions: Arc<Mutex<std::collections::HashMap<String, StreamingUploadSession>>>,
 }
 
 #[tauri::command]
@@ -184,6 +208,11 @@ async fn load_account_from_keystore(
     {
         let mut active_key = state.active_account_private_key.lock().await;
         *active_key = Some(private_key.clone());
+    }
+
+    // Update WebRTC service with the active private key for decryption
+    if let Some(webrtc_service) = state.webrtc.lock().await.as_ref() {
+        webrtc_service.set_active_private_key(Some(private_key.clone())).await;
     }
 
     // Derive account details from private key
@@ -298,6 +327,7 @@ async fn send_webrtc_file_request(
                     "unknown".to_string()
                 }
             },
+            recipient_public_key: None, // No encryption for basic downloads
         };
         webrtc.send_file_request(peer_id, request).await
     } else {
@@ -315,6 +345,16 @@ async fn get_webrtc_connection_status(
         Ok(webrtc.get_connection_status(&peer_id).await)
     } else {
         Ok(false)
+    }
+}
+
+#[tauri::command]
+async fn disconnect_from_peer(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
+    let webrtc = { state.webrtc.lock().await.as_ref().cloned() };
+    if let Some(webrtc) = webrtc {
+        webrtc.close_connection(peer_id).await
+    } else {
+        Err("WebRTC service not running".into())
     }
 }
 
@@ -342,20 +382,20 @@ async fn upload_versioned_file(
             .unwrap()
             .as_secs();
 
-// Use the DHT versioning helper to fill in parent_hash/version
-let metadata = dht
-    .prepare_versioned_metadata(
-        file_hash.clone(),
-        file_name,
-        file_data.len() as u64,  // Use file size directly from data
-        file_data,
-        created_at,
-        mime_type,
-        is_encrypted,
-        encryption_method,
-        key_fingerprint,
-    )
-    .await?;
+        // Use the DHT versioning helper to fill in parent_hash/version
+        let metadata = dht
+            .prepare_versioned_metadata(
+                file_hash.clone(),
+                file_name,
+                file_data.len() as u64, // Use file size directly from data
+                file_data,
+                created_at,
+                mime_type,
+                is_encrypted,
+                encryption_method,
+                key_fingerprint,
+            )
+            .await?;
 
         dht.publish_file(metadata.clone()).await?;
         Ok(metadata)
@@ -522,16 +562,16 @@ async fn get_blocks_mined(address: String) -> Result<u64, String> {
             }
         }
     }
-    
+
     // Invoke existing logic (slow query)
     let blocks = get_mined_blocks_count(&address).await?;
-    
+
     // Update Cache
     {
         let mut cache = BLOCKS_CACHE.lock().unwrap();
         *cache = Some((address, blocks, Instant::now()));
     }
-    
+
     Ok(blocks)
 }
 #[tauri::command]
@@ -553,6 +593,8 @@ async fn start_dht_node(
     autonat_servers: Option<Vec<String>>,
     proxy_address: Option<String>,
     is_bootstrap: Option<bool>,
+    chunk_size_kb: Option<usize>,
+    cache_size_mb: Option<usize>,
 ) -> Result<String, String> {
     {
         let dht_guard = state.dht.lock().await;
@@ -588,6 +630,8 @@ async fn start_dht_node(
         autonat_server_list,
         final_proxy_address,
         file_transfer_service,
+        chunk_size_kb,
+        cache_size_mb,
     )
     .await
     .map_err(|e| format!("Failed to start DHT: {}", e))?;
@@ -633,7 +677,6 @@ async fn start_dht_node(
                             let mut proxies = proxies_arc.lock().await;
 
                             if let Some(i) = proxies.iter().position(|p| p.id == id) {
-
                                 let p = &mut proxies[i];
                                 if p.id != id {
                                     p.id = id.clone();
@@ -725,7 +768,8 @@ async fn stop_dht_node(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     };
 
     if let Some(dht) = dht {
-        dht.shutdown()
+        (*dht)
+            .shutdown()
             .await
             .map_err(|e| format!("Failed to stop DHT: {}", e))?;
     }
@@ -768,6 +812,7 @@ async fn publish_file_metadata(
             is_encrypted: false,
             encryption_method: None,
             key_fingerprint: None,
+            merkle_root: None,
             parent_hash: None,
             version: Some(1),
             cids: None,
@@ -913,6 +958,8 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                 ),
                 DhtEvent::FileNotFound(hash) => format!("file_not_found:{}", hash),
                 DhtEvent::Error(err) => format!("error:{}", err),
+                DhtEvent::Info(msg) => format!("info:{}", msg),
+                DhtEvent::Warning(msg) => format!("warning:{}", msg),
                 DhtEvent::ProxyStatus {
                     id,
                     address,
@@ -976,9 +1023,9 @@ fn get_cpu_temperature() -> Option<f32> {
     use std::sync::OnceLock;
 
     static LAST_UPDATE: OnceLock<std::sync::Mutex<Option<Instant>>> = OnceLock::new();
-    
+
     let last_update_mutex = LAST_UPDATE.get_or_init(|| std::sync::Mutex::new(None));
-    
+
     {
         let mut last_update = last_update_mutex.lock().unwrap();
         if let Some(last) = *last_update {
@@ -1258,7 +1305,7 @@ async fn start_file_transfer_service(
         }
     }
 
-    let file_transfer_service = FileTransferService::new()
+    let file_transfer_service = FileTransferService::new_with_encryption(true)
         .await
         .map_err(|e| format!("Failed to start file transfer service: {}", e))?;
 
@@ -1269,7 +1316,7 @@ async fn start_file_transfer_service(
     }
 
     // Initialize WebRTC service with file transfer service
-    let webrtc_service = WebRTCService::new(ft_arc.clone())
+    let webrtc_service = WebRTCService::new(ft_arc.clone(), state.keystore.clone())
         .await
         .map_err(|e| format!("Failed to start WebRTC service: {}", e))?;
 
@@ -1277,6 +1324,41 @@ async fn start_file_transfer_service(
     {
         let mut webrtc_guard = state.webrtc.lock().await;
         *webrtc_guard = Some(webrtc_arc.clone());
+    }
+
+    // Initialize multi-source download service
+    let dht_arc = {
+        let dht_guard = state.dht.lock().await;
+        dht_guard.as_ref().cloned()
+    };
+
+    if let Some(dht_service) = dht_arc {
+        let multi_source_service = MultiSourceDownloadService::new(dht_service, webrtc_arc.clone());
+        let multi_source_arc = Arc::new(multi_source_service);
+        
+        {
+            let mut multi_source_guard = state.multi_source_download.lock().await;
+            *multi_source_guard = Some(multi_source_arc.clone());
+        }
+
+        // Start multi-source download service
+        {
+            let mut pump_guard = state.multi_source_pump.lock().await;
+            if pump_guard.is_none() {
+                let app_handle = app.clone();
+                let ms_clone = multi_source_arc.clone();
+                let handle = tokio::spawn(async move {
+                    pump_multi_source_events(app_handle, ms_clone).await;
+                });
+                *pump_guard = Some(handle);
+            }
+        }
+
+        // Start the service background task
+        let ms_clone = multi_source_arc.clone();
+        tokio::spawn(async move {
+            ms_clone.run().await;
+        });
     }
 
     {
@@ -1292,75 +1374,6 @@ async fn start_file_transfer_service(
     }
 
     Ok(())
-}
-
-#[tauri::command]
-async fn upload_file_to_network(
-    state: State<'_, AppState>,
-    file_path: String,
-) -> Result<(), String> {
-    let ft = {
-        let ft_guard = state.file_transfer.lock().await;
-        ft_guard.as_ref().cloned()
-    };
-
-    if let Some(ft) = ft {
-        // Upload the file
-        let file_name = file_path.split('/').last().unwrap_or(&file_path);
-
-        ft.upload_file(file_path.clone(), file_name.to_string())
-            .await
-            .map_err(|e| format!("Failed to upload file: {}", e))?;
-
-        // Get the file hash by reading the file and calculating it
-        let file_data = tokio::fs::read(&file_path)
-            .await
-            .map_err(|e| format!("Failed to read file: {}", e))?;
-        let file_hash = file_transfer::FileTransferService::calculate_file_hash(&file_data);
-
-        // Also publish to DHT if it's running
-        let dht = {
-            let dht_guard = state.dht.lock().await;
-            dht_guard.as_ref().cloned()
-        };
-
-        if let Some(dht) = dht {
-            let mut metadata = FileMetadata {
-                file_hash: file_hash.clone(),
-                file_name: file_name.to_string(),
-                file_size: file_data.len() as u64,
-                file_data: file_data.clone(),
-                seeders: vec![],
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                mime_type: None,
-                is_encrypted: false,
-                encryption_method: None,
-                key_fingerprint: None,
-                parent_hash: None,
-                version: Some(1),
-                cids: None,
-                is_root: true,
-            };
-
-            match dht.publish_file(metadata.clone()).await {
-                Ok(_) => {
-                    info!("Published file metadata to DHT: {}", file_hash);
-                    // Track upload in analytics
-                    state.analytics.record_upload(file_data.len() as u64).await;
-                    state.analytics.record_upload_completed().await;
-                }
-                Err(e) => warn!("Failed to publish file metadata to DHT: {}", e),
-            };
-            Ok(())
-        } else {
-            Err("DHT Service not running.".to_string())
-        }
-    } else {
-        Err("File transfer service is not running".to_string())
-    }
 }
 
 #[tauri::command]
@@ -1524,6 +1537,7 @@ async fn download_file_from_network(
                                                             file_name: metadata.file_name.clone(),
                                                             file_size: metadata.file_size,
                                                             requester_peer_id: dht_service.get_peer_id().await,
+                                                            recipient_public_key: None, // No encryption for basic downloads
                                                         };
 
                                                         match webrtc_service
@@ -1620,52 +1634,124 @@ async fn upload_file_data_to_network(
     encryption_method: Option<String>,
     key_fingerprint: Option<String>,
 ) -> Result<FileMetadata, String> {
+    // Check for active account - require login for all uploads
+    let _account = get_active_account(&state).await?;
+
     let dht_opt = { state.dht.lock().await.as_ref().cloned() };
     if let Some(dht) = dht_opt {
-        // Calculate file hash from the data
-        let file_hash = file_transfer::FileTransferService::calculate_file_hash(&file_data);
-        // Store the file data directly in memory
-        let file_size = file_data.len() as u64;
-        let cloned_fd = file_data.clone();
+        // Calculate file hash from the provided data
+        let file_hash = FileTransferService::calculate_file_hash(&file_data);
 
-        // Assuming ft is available in state or elsewhere
-        // ft.store_file_data(file_hash.clone(), file_name.clone(), file_data).await;
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         // Create metadata
         let metadata = FileMetadata {
             file_hash: file_hash.clone(),
-            file_name: file_name.clone(),
-            file_size,
-            file_data: cloned_fd,
+            file_name,
+            file_size: file_data.len() as u64,
+            file_data,
             seeders: vec![],
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            created_at,
             mime_type,
             is_encrypted,
             encryption_method,
             key_fingerprint,
+            merkle_root: None,
             parent_hash: None,
             version: Some(1),
             cids: None,
-            is_root: true, 
+            is_root: true,
         };
 
         // Publish to DHT
-        if let Err(e) = dht.publish_file(metadata.clone()).await {
-            warn!("Failed to publish file metadata to DHT: {}", e);
-            state.analytics.record_upload(file_size).await;
-            return Err(format!("Failed to publish file: {}", e));
+        dht.publish_file(metadata.clone()).await?;
+        Ok(metadata)
+    } else {
+        Err("DHT not running".into())
+    }
+}
+
+#[tauri::command]
+async fn upload_file_to_network(
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<FileMetadata, String> {
+    // Check for active account - require login for all uploads
+    let _account = get_active_account(&state).await?;
+
+    let dht_opt = { state.dht.lock().await.as_ref().cloned() };
+    if let Some(dht) = dht_opt {
+        // Stream the file data instead of loading it all into memory
+        let mut file = tokio::fs::File::open(&file_path)
+            .await
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+
+        // Calculate file hash incrementally while reading
+        let mut hasher = sha2::Sha256::new();
+        let mut file_data = Vec::new();
+        let mut buffer = [0u8; 8192]; // 8KB buffer
+
+        loop {
+            let bytes_read = file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| format!("Failed to read file: {}", e))?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            let chunk = &buffer[..bytes_read];
+            hasher.update(chunk);
+            file_data.extend_from_slice(chunk);
         }
 
+        let file_hash = format!("{:x}", hasher.finalize());
+
+        // Get file name from path
+        let file_name = std::path::Path::new(&file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Create metadata
+        let metadata = FileMetadata {
+            file_hash: file_hash.clone(),
+            file_name,
+            file_size: file_data.len() as u64,
+            file_data,
+            seeders: vec![],
+            created_at,
+            mime_type: None,
+            is_encrypted: false,
+            encryption_method: None,
+            key_fingerprint: None,
+            merkle_root: None,
+            parent_hash: None,
+            version: Some(1),
+            cids: None,
+            is_root: true,
+        };
+
+        // Publish to DHT
+        dht.publish_file(metadata.clone()).await?;
+
         // Track upload in analytics
-        state.analytics.record_upload(file_size).await;
+        state.analytics.record_upload(metadata.file_size).await;
         state.analytics.record_upload_completed().await;
 
         Ok(metadata)
     } else {
-        Err("DHT not running".to_string())
+        Err("DHT not running".into())
     }
 }
 
@@ -1698,10 +1784,166 @@ async fn show_in_folder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn write_file(path: String, contents: Vec<u8>) -> Result<(), String> {
-    tokio::fs::write(&path, contents)
-        .await
-        .map_err(|e| format!("Failed to write file: {}", e))?;
+async fn start_streaming_upload(
+    file_name: String,
+    file_size: u64,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    // Check for active account - require login for all uploads
+    let _account = get_active_account(&state).await?;
+
+    let dht_opt = { state.dht.lock().await.as_ref().cloned() };
+    if dht_opt.is_none() {
+        return Err("DHT not running".into());
+    }
+
+    // Generate a unique upload session ID
+    let upload_id = format!(
+        "upload_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    // Store upload session in app state
+    let mut upload_sessions = state.upload_sessions.lock().await;
+    upload_sessions.insert(
+        upload_id.clone(),
+        StreamingUploadSession {
+            file_name,
+            file_size,
+            received_chunks: 0,
+            total_chunks: 0, // Will be set when we know chunk count
+            hasher: sha2::Sha256::new(),
+            created_at: std::time::SystemTime::now(),
+            chunk_cids: Vec::new(),
+        },
+    );
+
+    Ok(upload_id)
+}
+
+#[tauri::command]
+async fn upload_file_chunk(
+    upload_id: String,
+    chunk_data: Vec<u8>,
+    chunk_index: u32,
+    is_last_chunk: bool,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let mut upload_sessions = state.upload_sessions.lock().await;
+    let session = upload_sessions
+        .get_mut(&upload_id)
+        .ok_or_else(|| format!("Upload session {} not found", upload_id))?;
+
+    // Update hasher with chunk data
+    session.hasher.update(&chunk_data);
+    session.received_chunks += 1;
+
+    // Store chunk directly in Bitswap (if DHT is available)
+    if let Some(dht) = state.dht.lock().await.as_ref() {
+        // Create a block from the chunk data
+        use dht::{split_into_blocks, StringBlock};
+        let blocks = split_into_blocks(&chunk_data, dht.chunk_size());
+
+        for block in blocks.iter() {
+            let cid = match block.cid() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("failed to get cid for chunk block: {}", e);
+                    return Err(format!("failed to get cid for chunk block: {}", e));
+                }
+            };
+
+            // Collect CID for root block creation
+            session.chunk_cids.push(cid.clone());
+
+            // Store block in Bitswap via DHT command
+            if let Err(e) = dht.store_block(cid.clone(), block.data().to_vec()).await {
+                error!("failed to store chunk block {}: {}", cid, e);
+                return Err(format!("failed to store chunk block {}: {}", cid, e));
+            }
+        }
+    }
+
+    if is_last_chunk {
+        // Calculate Merkle root for integrity verification
+        let hasher = std::mem::replace(&mut session.hasher, sha2::Sha256::new());
+        let merkle_root = format!("{:x}", hasher.finalize());
+
+        // Create root block containing the list of chunk CIDs
+        let chunk_cids = std::mem::take(&mut session.chunk_cids);
+        let root_block_data = match serde_json::to_vec(&chunk_cids) {
+            Ok(data) => data,
+            Err(e) => {
+                return Err(format!("Failed to serialize chunk CIDs: {}", e));
+            }
+        };
+
+        // Generate CID for the root block
+        use dht::{Cid, Code, MultihashDigest, RAW_CODEC};
+        let root_cid = Cid::new_v1(RAW_CODEC, Code::Sha2_256.digest(&root_block_data));
+
+        // Store root block in Bitswap
+        let dht_opt = { state.dht.lock().await.as_ref().cloned() };
+        if let Some(dht) = &dht_opt {
+            if let Err(e) = dht.store_block(root_cid.clone(), root_block_data).await {
+                error!("failed to store root block: {}", e);
+                return Err(format!("failed to store root block: {}", e));
+            }
+        } else {
+            return Err("DHT not running".into());
+        }
+
+        // Create minimal metadata (without file_data to avoid DHT size limits)
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let metadata = dht::FileMetadata {
+            file_hash: root_cid.to_string(), // Use root CID for retrieval
+            file_name: session.file_name.clone(),
+            file_size: session.file_size,
+            file_data: vec![], // Empty - data is stored in Bitswap blocks
+            seeders: vec![],
+            created_at,
+            mime_type: None,
+            is_encrypted: false,
+            encryption_method: None,
+            key_fingerprint: None,
+            merkle_root: Some(merkle_root), // Store Merkle root for verification
+            parent_hash: None,
+            version: Some(1),
+            cids: None, // CIDs are stored in the root block, not in metadata
+            is_root: true,
+        };
+
+        // Publish to DHT
+        if let Some(dht) = dht_opt {
+            dht.publish_file(metadata.clone()).await?;
+        } else {
+            return Err("DHT not running".into());
+        }
+
+        // Clean up session
+        let file_hash = root_cid.to_string();
+        upload_sessions.remove(&upload_id);
+
+        Ok(Some(file_hash))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn cancel_streaming_upload(
+    upload_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut upload_sessions = state.upload_sessions.lock().await;
+    upload_sessions.remove(&upload_id);
     Ok(())
 }
 
@@ -1788,6 +2030,190 @@ async fn pump_file_transfer_events(app: tauri::AppHandle, ft: Arc<FileTransferSe
             }
         }
     }
+}
+
+async fn pump_multi_source_events(app: tauri::AppHandle, ms: Arc<MultiSourceDownloadService>) {
+    loop {
+        let events = ms.drain_events(64).await;
+        if events.is_empty() {
+            if Arc::strong_count(&ms) <= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+
+        for event in events {
+            match &event {
+                MultiSourceEvent::DownloadStarted { file_hash, total_peers } => {
+                    if let Err(err) = app.emit("multi_source_download_started", &event) {
+                        warn!("Failed to emit multi_source_download_started event: {}", err);
+                    }
+                }
+                MultiSourceEvent::ProgressUpdate { file_hash, progress } => {
+                    if let Err(err) = app.emit("multi_source_progress_update", progress) {
+                        warn!("Failed to emit multi_source_progress_update event: {}", err);
+                    }
+                }
+                MultiSourceEvent::DownloadCompleted { file_hash, output_path, duration_secs, average_speed_bps } => {
+                    if let Err(err) = app.emit("multi_source_download_completed", &event) {
+                        warn!("Failed to emit multi_source_download_completed event: {}", err);
+                    }
+                }
+                _ => {
+                    if let Err(err) = app.emit("multi_source_event", &event) {
+                        warn!("Failed to emit multi_source_event: {}", err);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn start_multi_source_download(
+    state: State<'_, AppState>,
+    file_hash: String,
+    output_path: String,
+    max_peers: Option<usize>,
+    chunk_size: Option<usize>,
+) -> Result<String, String> {
+    let ms = {
+        let ms_guard = state.multi_source_download.lock().await;
+        ms_guard.as_ref().cloned()
+    };
+
+    if let Some(multi_source_service) = ms {
+        multi_source_service
+            .start_download(file_hash.clone(), output_path, max_peers, chunk_size)
+            .await?;
+        
+        Ok(format!("Multi-source download started for: {}", file_hash))
+    } else {
+        Err("Multi-source download service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn cancel_multi_source_download(
+    state: State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    let ms = {
+        let ms_guard = state.multi_source_download.lock().await;
+        ms_guard.as_ref().cloned()
+    };
+
+    if let Some(multi_source_service) = ms {
+        multi_source_service.cancel_download(file_hash).await
+    } else {
+        Err("Multi-source download service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_multi_source_progress(
+    state: State<'_, AppState>,
+    file_hash: String,
+) -> Result<Option<MultiSourceProgress>, String> {
+    let ms = {
+        let ms_guard = state.multi_source_download.lock().await;
+        ms_guard.as_ref().cloned()
+    };
+
+    if let Some(multi_source_service) = ms {
+        Ok(multi_source_service.get_download_progress(&file_hash).await)
+    } else {
+        Err("Multi-source download service not available".to_string())
+    }
+}
+
+// Helper function to ensure multi-source download service is initialized
+async fn ensure_multi_source_service(state: &State<'_, AppState>) -> Result<Arc<MultiSourceDownloadService>, String> {
+    // Check if service already exists
+    {
+        let ms_guard = state.multi_source_download.lock().await;
+        if let Some(service) = ms_guard.as_ref() {
+            return Ok(service.clone());
+        }
+    }
+
+    // Service doesn't exist, create it
+    let dht_arc = {
+        let dht_guard = state.dht.lock().await;
+        dht_guard.as_ref().cloned()
+    };
+
+    let webrtc_arc = {
+        let webrtc_guard = state.webrtc.lock().await;
+        webrtc_guard.as_ref().cloned()
+    };
+
+    if let (Some(dht_service), Some(webrtc_service)) = (dht_arc, webrtc_arc) {
+        let multi_source_service = MultiSourceDownloadService::new(dht_service, webrtc_service);
+        let multi_source_arc = Arc::new(multi_source_service);
+        
+        {
+            let mut multi_source_guard = state.multi_source_download.lock().await;
+            *multi_source_guard = Some(multi_source_arc.clone());
+        }
+
+        Ok(multi_source_arc)
+    } else {
+        Err("DHT or WebRTC service not available for multi-source download initialization".to_string())
+    }
+}
+
+#[tauri::command]
+async fn update_proxy_latency(
+    state: State<'_, AppState>,
+    proxy_id: String,
+    latency_ms: Option<u64>,
+) -> Result<(), String> {
+    let multi_source_service = ensure_multi_source_service(&state).await?;
+    multi_source_service.update_proxy_latency(proxy_id, latency_ms).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_proxy_optimization_status(
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let multi_source_service = ensure_multi_source_service(&state).await?;
+    Ok(multi_source_service.get_proxy_optimization_status().await)
+}
+
+
+
+#[tauri::command]
+async fn download_file_multi_source(
+    state: State<'_, AppState>,
+    file_hash: String,
+    output_path: String,
+    prefer_multi_source: Option<bool>,
+    max_peers: Option<usize>,
+) -> Result<String, String> {
+    let prefer_multi_source = prefer_multi_source.unwrap_or(true);
+    
+    // If multi-source is preferred and available, use it
+    if prefer_multi_source {
+        let ms = {
+            let ms_guard = state.multi_source_download.lock().await;
+            ms_guard.as_ref().cloned()
+        };
+
+        if let Some(multi_source_service) = ms {
+            info!("Using multi-source download for file: {}", file_hash);
+            return multi_source_service
+                .start_download(file_hash.clone(), output_path, max_peers, None)
+                .await
+                .map(|_| format!("Multi-source download initiated for: {}", file_hash));
+        }
+    }
+
+    // Fallback to original single-source download
+    info!("Falling back to single-source download for file: {}", file_hash);
+    download_file_from_network(state, file_hash, output_path).await
 }
 
 #[tauri::command]
@@ -1885,12 +2311,123 @@ async fn search_file_metadata(
 }
 
 #[tauri::command]
-fn get_available_storage() -> f64 {
-    let storage = available_space(Path::new("/")).unwrap_or(0);
-    (storage as f64 / 1024.0 / 1024.0 / 1024.0).floor()
+async fn get_available_storage() -> f64 {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // On Windows, use the current directory's drive, on Unix use "/"
+    let path = if cfg!(windows) {
+        Path::new(".")
+    } else {
+        Path::new("/")
+    };
+
+    // Add timeout to prevent hanging - run in a blocking task with timeout
+    let result = timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            available_space(path).map(|space| space as f64 / 1024.0 / 1024.0 / 1024.0)
+            // Convert to GB
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(storage_result)) => match storage_result {
+            Ok(storage_gb) => {
+                if storage_gb > 0.0 && storage_gb.is_finite() {
+                    storage_gb.floor()
+                } else {
+                    warn!("Invalid storage value: {:.2}, using fallback", storage_gb);
+                    100.0
+                }
+            }
+            Err(e) => {
+                warn!("Disk space check failed: {}, using fallback", e);
+                100.0
+            }
+        },
+        Ok(Err(e)) => {
+            warn!("Task failed: {}, using fallback", e);
+            100.0
+        }
+        Err(_) => {
+            warn!("Failed to get available storage (timeout or error), using fallback");
+            100.0
+        }
+    }
 }
 
 const DEFAULT_GETH_DATA_DIR: &str = "./bin/geth-data";
+
+/// Robust disk space checking that tries multiple methods to avoid hanging
+fn get_disk_space_robust(path: &std::path::Path) -> Result<f64, String> {
+    use std::fs;
+    use std::process::Command;
+
+    // Method 1: Try fs2::available_space (can hang on Windows)
+    match available_space(path) {
+        Ok(space) => return Ok(space as f64 / 1024.0 / 1024.0 / 1024.0),
+        Err(_) => {
+            // Continue to other methods
+        }
+    }
+
+    // Method 2: Try using system commands (Windows: wmic, Unix: df)
+    #[cfg(windows)]
+    {
+        match Command::new("wmic")
+            .args(&["logicaldisk", "where", "name='C:'", "get", "freespace"])
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        let line = line.trim();
+                        if let Ok(bytes) = line.parse::<u64>() {
+                            return Ok(bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        match Command::new("df").arg(path).arg("-k").output() {
+            Ok(output) => {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines().skip(1) {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 4 {
+                            if let Ok(kilobytes) = parts[3].parse::<u64>() {
+                                return Ok(kilobytes as f64 / 1024.0 / 1024.0);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Method 3: Try filesystem metadata (less accurate but won't hang)
+    match fs::metadata(path) {
+        Ok(_) => {
+            // If we can read metadata, assume we have at least some space
+            // This is a fallback that won't hang
+            return Ok(50.0); // Assume 50GB as safe fallback
+        }
+        Err(_) => {}
+    }
+
+    // Final fallback
+    Err("Unable to determine available disk space".to_string())
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2035,6 +2572,11 @@ async fn logout(state: State<'_, AppState>) -> Result<(), ()> {
     // Clear private key from memory
     let mut active_key = state.active_account_private_key.lock().await;
     *active_key = None;
+
+    // Clear private key from WebRTC service
+    if let Some(webrtc_service) = state.webrtc.lock().await.as_ref() {
+        webrtc_service.set_active_private_key(None).await;
+    }
 
     Ok(())
 }
@@ -2232,6 +2774,21 @@ async fn get_peer_metrics(
     let dht_guard = state.dht.lock().await;
     if let Some(ref dht) = *dht_guard {
         Ok(dht.get_peer_metrics().await)
+    } else {
+        Err("DHT service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn report_malicious_peer(
+    peer_id: String,
+    severity: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let dht_guard = state.dht.lock().await;
+    if let Some(ref dht) = *dht_guard {
+        dht.report_malicious_peer(&peer_id, &severity).await;
+        Ok(())
     } else {
         Err("DHT service not available".to_string())
     }
@@ -2582,9 +3139,9 @@ fn main() {
             .with(
                 EnvFilter::from_default_env()
                     .add_directive("chiral_network=info".parse().unwrap())
-                    .add_directive("libp2p=debug".parse().unwrap())
+                    .add_directive("libp2p=info".parse().unwrap())
                     .add_directive("libp2p_kad=debug".parse().unwrap())
-                    .add_directive("libp2p_swarm=debug".parse().unwrap()),
+                    .add_directive("libp2p_swarm=info".parse().unwrap()),
             )
             .init();
     }
@@ -2623,8 +3180,13 @@ fn main() {
             dht: Mutex::new(None),
             file_transfer: Mutex::new(None),
             webrtc: Mutex::new(None),
+            multi_source_download: Mutex::new(None),
+            keystore: Arc::new(Mutex::new(
+                Keystore::load().unwrap_or_else(|_| Keystore::new()),
+            )),
             proxies: Arc::new(Mutex::new(Vec::new())),
             file_transfer_pump: Mutex::new(None),
+            multi_source_pump: Mutex::new(None),
             socks5_proxy_cli: Mutex::new(args.socks5_proxy),
             analytics: Arc::new(analytics::AnalyticsService::new()),
 
@@ -2632,10 +3194,14 @@ fn main() {
             transaction_queue: Arc::new(Mutex::new(VecDeque::new())),
             transaction_processor: Mutex::new(None),
             processing_transaction: Arc::new(Mutex::new(false)),
+
+            // Initialize upload sessions
+            upload_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
         .invoke_handler(tauri::generate_handler![
             create_chiral_account,
             import_chiral_account,
+            has_active_account,
             get_network_peer_count,
             start_geth_node,
             stop_geth_node,
@@ -2688,18 +3254,26 @@ fn main() {
             upload_file_data_to_network,
             download_file_from_network,
             download_blocks_from_network,
+            start_multi_source_download,
+            cancel_multi_source_download,
+            get_multi_source_progress,
+            update_proxy_latency,
+            get_proxy_optimization_status,
+
+            download_file_multi_source,
             get_file_transfer_events,
             get_download_metrics,
             encrypt_file_with_password,
             decrypt_file_with_password,
             encrypt_file_for_upload,
             show_in_folder,
-            write_file,
             get_available_storage,
             proxy_connect,
             proxy_disconnect,
+            proxy_remove,
             proxy_echo,
             list_proxies,
+            get_bootstrap_nodes_command,
             generate_totp_secret,
             is_2fa_enabled,
             verify_and_enable_totp,
@@ -2710,6 +3284,7 @@ fn main() {
             record_transfer_success,
             record_transfer_failure,
             get_peer_metrics,
+            report_malicious_peer,
             select_peers_with_strategy,
             set_peer_encryption_support,
             cleanup_inactive_peers,
@@ -2718,6 +3293,10 @@ fn main() {
             establish_webrtc_connection,
             send_webrtc_file_request,
             get_webrtc_connection_status,
+            disconnect_from_peer,
+            start_streaming_upload,
+            upload_file_chunk,
+            cancel_streaming_upload,
             get_bandwidth_stats,
             get_bandwidth_history,
             get_performance_metrics,
@@ -2726,6 +3305,7 @@ fn main() {
             get_contribution_history,
             reset_analytics,
             encrypt_file_for_self_upload,
+            encrypt_file_for_recipient,
             decrypt_and_reassemble_file,
         ])
         .plugin(tauri_plugin_process::init())
@@ -2892,6 +3472,7 @@ pub struct FileManifestForJs {
 
 #[tauri::command]
 async fn encrypt_file_for_self_upload(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     file_path: String,
 ) -> Result<FileManifestForJs, String> {
@@ -2901,36 +3482,114 @@ async fn encrypt_file_for_self_upload(
         .lock()
         .await
         .clone()
-        .ok_or("No active account. Please log in to encrypt.")?;
-    let pk_bytes = hex::decode(private_key_hex.trim_start_matches("0x"))
-        .map_err(|_| "Invalid private key format".to_string())?;
-    let secret_key = StaticSecret::from(
-        <[u8; 32]>::try_from(pk_bytes).map_err(|_| "Private key is not 32 bytes")?,
-    );
-    let public_key = PublicKey::from(&secret_key);
+        .ok_or("No account is currently active. Please log in.")?;
 
-    // 2. Initialize ChunkManager. This assumes your storage path is configured.
-    //    You might need to get this path from your settings store.
-    let storage_path = PathBuf::from("./chunk_storage"); // Or get from config
-    let manager = ChunkManager::new(storage_path);
+    // Get the app data directory for chunk storage
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not get app data directory: {}", e))?;
+    let chunk_storage_path = app_data_dir.join("chunk_storage");
 
-    // 3. Call the existing backend function to perform the encryption.
-    let manifest = manager
-        .chunk_and_encrypt_file(Path::new(&file_path), &public_key)?;
+    // Run the encryption in a blocking task to avoid blocking the async runtime
+    tokio::task::spawn_blocking(move || {
+        let pk_bytes = hex::decode(private_key_hex.trim_start_matches("0x"))
+            .map_err(|_| "Invalid private key format".to_string())?;
+        let secret_key = StaticSecret::from(
+            <[u8; 32]>::try_from(pk_bytes).map_err(|_| "Private key is not 32 bytes")?,
+        );
+        let public_key = PublicKey::from(&secret_key);
 
-    // 4. Serialize the key bundle to a JSON string so it can be sent to the frontend easily.
-    let bundle_json = serde_json::to_string(&manifest.encrypted_key_bundle)
-        .map_err(|e| e.to_string())?;
+        // 2. Initialize ChunkManager with proper app data directory
+        let manager = ChunkManager::new(chunk_storage_path);
 
-    Ok(FileManifestForJs {
-        merkle_root: manifest.merkle_root,
-        chunks: manifest.chunks,
-        encrypted_key_bundle: bundle_json,
+        // 3. Call the existing backend function to perform the encryption.
+        let manifest = manager.chunk_and_encrypt_file(Path::new(&file_path), &public_key)?;
+
+        // 4. Serialize the key bundle to a JSON string so it can be sent to the frontend easily.
+        let bundle_json =
+            serde_json::to_string(&manifest.encrypted_key_bundle).map_err(|e| e.to_string())?;
+
+        Ok(FileManifestForJs {
+            merkle_root: manifest.merkle_root,
+            chunks: manifest.chunks,
+            encrypted_key_bundle: bundle_json,
+        })
     })
+    .await
+    .map_err(|e| format!("Encryption task failed: {}", e))?
+}
+
+/// Encrypt a file for upload with optional recipient public key
+#[tauri::command]
+async fn encrypt_file_for_recipient(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    file_path: String,
+    recipient_public_key: Option<String>,
+) -> Result<FileManifestForJs, String> {
+    // Get the app data directory for chunk storage
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not get app data directory: {}", e))?;
+    let chunk_storage_path = app_data_dir.join("chunk_storage");
+
+    // Determine the public key to use for encryption
+    let recipient_pk = if let Some(pk_hex) = recipient_public_key {
+        // Use the provided recipient public key
+        let pk_bytes = hex::decode(pk_hex.trim_start_matches("0x"))
+            .map_err(|_| "Invalid recipient public key format".to_string())?;
+        PublicKey::from(
+            <[u8; 32]>::try_from(pk_bytes).map_err(|_| "Recipient public key is not 32 bytes")?,
+        )
+    } else {
+        // Use the active user's own public key
+        let private_key_hex = state
+            .active_account_private_key
+            .lock()
+            .await
+            .clone()
+            .ok_or("No account is currently active. Please log in.")?;
+        let pk_bytes = hex::decode(private_key_hex.trim_start_matches("0x"))
+            .map_err(|_| "Invalid private key format".to_string())?;
+        let secret_key = StaticSecret::from(
+            <[u8; 32]>::try_from(pk_bytes).map_err(|_| "Private key is not 32 bytes")?,
+        );
+        PublicKey::from(&secret_key)
+    };
+
+    // Run the encryption in a blocking task to avoid blocking the async runtime
+    tokio::task::spawn_blocking(move || {
+        // Initialize ChunkManager with proper app data directory
+        let manager = ChunkManager::new(chunk_storage_path);
+
+        // Call the existing backend function to perform the encryption with recipient's public key
+        let manifest = manager
+            .chunk_and_encrypt_file(Path::new(&file_path), &recipient_pk)?;
+
+        // Serialize the key bundle to a JSON string so it can be sent to the frontend easily.
+        let bundle_json = serde_json::to_string(&manifest.encrypted_key_bundle)
+            .map_err(|e| e.to_string())?;
+
+        Ok(FileManifestForJs {
+            merkle_root: manifest.merkle_root,
+            chunks: manifest.chunks,
+            encrypted_key_bundle: bundle_json,
+        })
+    })
+    .await
+    .map_err(|e| format!("Encryption task failed: {}", e))?
+}
+
+#[tauri::command]
+async fn has_active_account(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.active_account.lock().await.is_some())
 }
 
 #[tauri::command]
 async fn decrypt_and_reassemble_file(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     manifest_js: FileManifestForJs,
     output_path: String,
@@ -2941,7 +3600,7 @@ async fn decrypt_and_reassemble_file(
         .lock()
         .await
         .clone()
-        .ok_or("No active account. Please log in to decrypt.")?;
+        .ok_or("No account is currently active. Please log in.")?;
 
     let pk_bytes = hex::decode(private_key_hex.trim_start_matches("0x"))
         .map_err(|_| "Invalid private key format".to_string())?;
@@ -2953,15 +3612,30 @@ async fn decrypt_and_reassemble_file(
     let encrypted_key_bundle: encryption::EncryptedAesKeyBundle =
         serde_json::from_str(&manifest_js.encrypted_key_bundle).map_err(|e| e.to_string())?;
 
-    // 3. Initialize ChunkManager.
-    let storage_path = PathBuf::from("./chunk_storage"); // Or get from config
-    let manager = ChunkManager::new(storage_path);
+    // Get the app data directory for chunk storage
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not get app data directory: {}", e))?;
+    let chunk_storage_path = app_data_dir.join("chunk_storage");
 
-    // 4. Call the existing backend function to decrypt and save the file.
-    manager.reassemble_and_decrypt_file(
-        &manifest_js.chunks,
-        Path::new(&output_path),
-        &encrypted_key_bundle,
-        &secret_key, // Pass the secret key
-    )
+    // 3. Clone the data we need for the blocking task
+    let chunks = manifest_js.chunks.clone();
+    let output_path_clone = output_path.clone();
+
+    // Run the decryption in a blocking task to avoid blocking the async runtime
+    tokio::task::spawn_blocking(move || {
+        // 4. Initialize ChunkManager with proper app data directory
+        let manager = ChunkManager::new(chunk_storage_path);
+
+        // 5. Call the existing backend function to decrypt and save the file.
+        manager.reassemble_and_decrypt_file(
+            &chunks,
+            Path::new(&output_path_clone),
+            &encrypted_key_bundle,
+            &secret_key, // Pass the secret key
+        )
+    })
+    .await
+    .map_err(|e| format!("Decryption task failed: {}", e))?
 }

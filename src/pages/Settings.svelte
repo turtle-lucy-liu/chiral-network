@@ -27,6 +27,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import Expandable from "$lib/components/ui/Expandable.svelte";
   import { settings, type AppSettings } from "$lib/stores";
+  import { bandwidthScheduler } from "$lib/services/bandwidthScheduler";
 
   let showResetConfirmModal = false;
   let storageSectionOpen = false;
@@ -53,7 +54,11 @@
     // Privacy settings
     enableProxy: true,
     proxyAddress: "127.0.0.1:9050", // Default Tor SOCKS address
-    enableEncryption: true,
+    enableAutonat: true,
+    autonatProbeInterval: 30,
+    autonatServers: [],
+    enableAutorelay: true,
+    preferredRelays: [],
     anonymousMode: false,
     shareAnalytics: true,
 
@@ -70,6 +75,8 @@
     cacheSize: 1024, // MB
     logLevel: "info",
     autoUpdate: true,
+    enableBandwidthScheduling: false,
+    bandwidthSchedules: [],
   };
   let localSettings: AppSettings = get(settings); 
   let savedSettings: AppSettings = get(settings);
@@ -82,6 +89,10 @@
     message: string;
     type: "success" | "error";
   } | null = null;
+
+  // NAT configuration text bindings
+  let autonatServersText = '';
+  let preferredRelaysText = '';
 
   const locations = [
     { value: "US-East", label: "US East" },
@@ -97,6 +108,10 @@
     { value: "zh", label: $t("language.chinese") },
     { value: "ko", label: $t("language.korean") },
   ];
+
+  // Initialize NAT configuration text from arrays
+  $: autonatServersText = localSettings.autonatServers?.join('\n') || '';
+  $: preferredRelaysText = localSettings.preferredRelays?.join('\n') || '';
 
   // Check for changes
   $: hasChanges = JSON.stringify(localSettings) !== JSON.stringify(savedSettings);
@@ -114,6 +129,10 @@
     
     savedSettings = JSON.parse(JSON.stringify(localSettings));
     userLocation.set(localSettings.userLocation);
+    
+    // Force bandwidth scheduler to update with new settings
+    bandwidthScheduler.forceUpdate();
+    
     importExportFeedback = null;
     showToast("Settings Updated!");
   }
@@ -249,6 +268,20 @@
     (event.target as HTMLInputElement).value = "";
   }
 
+  function updateAutonatServers() {
+    localSettings.autonatServers = autonatServersText
+      .split('\n')
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+  }
+
+  function updatePreferredRelays() {
+    localSettings.preferredRelays = preferredRelaysText
+      .split('\n')
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+  }
+
     onMount(async () => {
     // Load settings from local storage
     const stored = localStorage.getItem("chiralSettings");
@@ -358,6 +391,11 @@ const sectionLabels: Record<string, string[]> = {
     $t("network.enableNat"),
     $t("network.enableDht"),
   ],
+  bandwidthScheduling: [
+    "Bandwidth Scheduling",
+    "Enable Bandwidth Scheduling",
+    "Schedule different bandwidth limits",
+  ],
   language: [
     $t("language.title"),
     $t("language.select"),
@@ -365,7 +403,6 @@ const sectionLabels: Record<string, string[]> = {
   privacy: [
     $t("privacy.title"),
     $t("privacy.enableProxy"),
-    $t("privacy.enableEncryption"),
     $t("privacy.anonymousMode"),
     $t("privacy.shareAnalytics"),
   ],
@@ -415,7 +452,7 @@ function sectionMatches(section: string, query: string) {
   <div class="mb-4 flex items-center gap-2">
     <Input
       type="text"
-      placeholder="Search settings..."
+      placeholder={$t('settings.searchPlaceholder')}
       bind:value={search}
       class="w-full"
     />
@@ -626,6 +663,172 @@ function sectionMatches(section: string, query: string) {
     </Expandable>
   {/if}
 
+  <!-- Bandwidth Scheduling -->
+  {#if sectionMatches("bandwidthScheduling", search)}
+    <Expandable>
+      <div slot="title" class="flex items-center gap-3">
+        <RefreshCw class="h-6 w-6 text-blue-600" />
+        <h2 class="text-xl font-semibold text-black">{$t('bandwidthScheduling.title')}</h2>
+      </div>
+      <div class="space-y-4">
+        <div class="flex items-center gap-2">
+          <input
+            type="checkbox"
+            id="enable-bandwidth-scheduling"
+            bind:checked={localSettings.enableBandwidthScheduling}
+          />
+          <Label for="enable-bandwidth-scheduling" class="cursor-pointer">
+            {$t('bandwidthScheduling.enable')}
+          </Label>
+        </div>
+        <p class="text-xs text-muted-foreground">
+          {$t('bandwidthScheduling.description')}
+        </p>
+
+        {#if localSettings.enableBandwidthScheduling}
+          <div class="space-y-3 mt-4">
+            {#each localSettings.bandwidthSchedules as schedule, index}
+              <div class="p-4 border rounded-lg bg-muted/30">
+                <div class="flex items-start justify-between gap-4 mb-3">
+                  <div class="flex items-center gap-2 flex-1">
+                    <input
+                      type="checkbox"
+                      id="schedule-enabled-{index}"
+                      bind:checked={schedule.enabled}
+                      on:change={() => {
+                        localSettings.bandwidthSchedules = [...localSettings.bandwidthSchedules];
+                      }}
+                    />
+                    <Input
+                      type="text"
+                      bind:value={schedule.name}
+                      placeholder={$t('bandwidthScheduling.scheduleName')}
+                      class="flex-1"
+                      on:input={() => {
+                        localSettings.bandwidthSchedules = [...localSettings.bandwidthSchedules];
+                      }}
+                    />
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    on:click={() => {
+                      localSettings.bandwidthSchedules = localSettings.bandwidthSchedules.filter((_, i) => i !== index);
+                    }}
+                  >
+                    {$t('bandwidthScheduling.remove')}
+                  </Button>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3 mb-3">
+                  <div>
+                    <Label for="schedule-start-{index}" class="text-xs">{$t('bandwidthScheduling.startTime')}</Label>
+                    <Input
+                      id="schedule-start-{index}"
+                      type="time"
+                      bind:value={schedule.startTime}
+                      class="mt-1"
+                      on:input={() => {
+                        localSettings.bandwidthSchedules = [...localSettings.bandwidthSchedules];
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <Label for="schedule-end-{index}" class="text-xs">{$t('bandwidthScheduling.endTime')}</Label>
+                    <Input
+                      id="schedule-end-{index}"
+                      type="time"
+                      bind:value={schedule.endTime}
+                      class="mt-1"
+                      on:input={() => {
+                        localSettings.bandwidthSchedules = [...localSettings.bandwidthSchedules];
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div class="mb-3">
+                  <Label class="text-xs">{$t('bandwidthScheduling.daysOfWeek')}</Label>
+                  <div class="flex gap-2 mt-1">
+                    {#each [{value: 0, label: $t('bandwidthScheduling.days.sun')}, {value: 1, label: $t('bandwidthScheduling.days.mon')}, {value: 2, label: $t('bandwidthScheduling.days.tue')}, {value: 3, label: $t('bandwidthScheduling.days.wed')}, {value: 4, label: $t('bandwidthScheduling.days.thu')}, {value: 5, label: $t('bandwidthScheduling.days.fri')}, {value: 6, label: $t('bandwidthScheduling.days.sat')}] as day}
+                      <button
+                        type="button"
+                        class="px-2 py-1 text-xs rounded border {schedule.daysOfWeek.includes(day.value) ? 'bg-primary text-primary-foreground' : 'bg-background'}"
+                        on:click={() => {
+                          // Update the schedule's days
+                          if (schedule.daysOfWeek.includes(day.value)) {
+                            schedule.daysOfWeek = schedule.daysOfWeek.filter(d => d !== day.value);
+                          } else {
+                            schedule.daysOfWeek = [...schedule.daysOfWeek, day.value].sort();
+                          }
+                          // Trigger reactivity by reassigning the entire array
+                          localSettings.bandwidthSchedules = [...localSettings.bandwidthSchedules];
+                        }}
+                      >
+                        {day.label}
+                      </button>
+                    {/each}
+                  </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <Label for="schedule-upload-{index}" class="text-xs">{$t('bandwidthScheduling.uploadLimit')}</Label>
+                    <Input
+                      id="schedule-upload-{index}"
+                      type="number"
+                      bind:value={schedule.uploadLimit}
+                      min="0"
+                      class="mt-1"
+                      on:input={() => {
+                        localSettings.bandwidthSchedules = [...localSettings.bandwidthSchedules];
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <Label for="schedule-download-{index}" class="text-xs">{$t('bandwidthScheduling.downloadLimit')}</Label>
+                    <Input
+                      id="schedule-download-{index}"
+                      type="number"
+                      bind:value={schedule.downloadLimit}
+                      min="0"
+                      class="mt-1"
+                      on:input={() => {
+                        localSettings.bandwidthSchedules = [...localSettings.bandwidthSchedules];
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            {/each}
+
+            <Button
+              size="sm"
+              variant="outline"
+              on:click={() => {
+                localSettings.bandwidthSchedules = [
+                  ...localSettings.bandwidthSchedules,
+                  {
+                    id: `schedule-${Date.now()}`,
+                    name: $t('bandwidthScheduling.scheduleDefault', { values: { number: localSettings.bandwidthSchedules.length + 1 } }),
+                    startTime: '00:00',
+                    endTime: '23:59',
+                    daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+                    uploadLimit: 0,
+                    downloadLimit: 0,
+                    enabled: true,
+                  },
+                ];
+              }}
+            >
+              {$t('bandwidthScheduling.addSchedule')}
+            </Button>
+          </div>
+        {/if}
+      </div>
+    </Expandable>
+  {/if}
+
   <!-- Language Settings -->
   {#if sectionMatches("language", search)}
     <Expandable>
@@ -679,15 +882,84 @@ function sectionMatches(section: string, query: string) {
           </div>
         {/if}
 
-        <div class="flex items-center gap-2">
-          <input
-            type="checkbox"
-            id="enable-encryption"
-            bind:checked={localSettings.enableEncryption}
-          />
-          <Label for="enable-encryption" class="cursor-pointer">
-            {$t("privacy.enableEncryption")}
-          </Label>
+        <!-- AutoNAT Configuration -->
+        <div class="space-y-3 border-t pt-3">
+          <h4 class="font-medium">NAT Traversal & Reachability</h4>
+
+          <div class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="enable-autonat"
+              bind:checked={localSettings.enableAutonat}
+            />
+            <Label for="enable-autonat" class="cursor-pointer">
+              Enable AutoNAT Reachability Detection
+            </Label>
+          </div>
+
+          {#if localSettings.enableAutonat}
+            <div>
+              <Label for="autonat-interval">Probe Interval (seconds)</Label>
+              <Input
+                id="autonat-interval"
+                type="number"
+                bind:value={localSettings.autonatProbeInterval}
+                min="10"
+                max="300"
+                placeholder="30"
+                class="mt-1"
+              />
+              <p class="text-xs text-muted-foreground mt-1">
+                How often to check network reachability (default: 30s)
+              </p>
+            </div>
+
+            <div>
+              <Label for="autonat-servers">Custom AutoNAT Servers (optional)</Label>
+              <textarea
+                id="autonat-servers"
+                bind:value={autonatServersText}
+                on:blur={updateAutonatServers}
+                placeholder="/ip4/1.2.3.4/tcp/4001/p2p/QmPeerId&#10;One multiaddr per line"
+                rows="3"
+                class="w-full px-3 py-2 border rounded-md text-sm"
+              ></textarea>
+              <p class="text-xs text-muted-foreground mt-1">
+                Leave empty to use bootstrap nodes
+              </p>
+            </div>
+          {/if}
+        </div>
+
+        <!-- AutoRelay Configuration -->
+        <div class="space-y-3 border-t pt-3">
+          <div class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="enable-autorelay"
+              bind:checked={localSettings.enableAutorelay}
+            />
+            <Label for="enable-autorelay" class="cursor-pointer">
+              Enable Circuit Relay v2 (AutoRelay)
+            </Label>
+          </div>
+
+          {#if localSettings.enableAutorelay}
+            <div>
+              <Label for="preferred-relays">Preferred Relay Nodes (optional)</Label>
+              <textarea
+                id="preferred-relays"
+                bind:value={preferredRelaysText}
+                on:blur={updatePreferredRelays}
+                placeholder="/ip4/relay.example.com/tcp/4001/p2p/QmRelayId&#10;One multiaddr per line"
+                rows="3"
+                class="w-full px-3 py-2 border rounded-md text-sm"
+              ></textarea>
+              <p class="text-xs text-muted-foreground mt-1">
+                Leave empty to use bootstrap nodes as relays
+              </p>
+            </div>
+          {/if}
         </div>
 
         <div class="flex items-center gap-2">

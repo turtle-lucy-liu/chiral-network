@@ -202,7 +202,7 @@ impl FileEncryption {
 
 /// A bundle containing the encrypted AES key and the necessary data for decryption.
 /// This struct is designed to be serialized (e.g., to JSON) and stored as file metadata.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EncryptedAesKeyBundle {
     /// The sender's temporary public key (32 bytes), hex-encoded.
     pub ephemeral_public_key: String,
@@ -248,7 +248,10 @@ pub fn encrypt_aes_key(
     let shared_secret = ephemeral_secret.diffie_hellman(recipient_public_key);
 
     // 3. Use HKDF to derive a Key Encryption Key (KEK) from the shared secret.
-    let hk = Hkdf::<Sha256>::new(Some(ephemeral_public_key.as_bytes()), shared_secret.as_bytes());
+    let hk = Hkdf::<Sha256>::new(
+        Some(ephemeral_public_key.as_bytes()),
+        shared_secret.as_bytes(),
+    );
     let mut kek = [0u8; 32]; // 32 bytes for an AES-256 key
     hk.expand(b"chiral-network-kek", &mut kek)
         .map_err(|e| format!("HKDF expansion failed: {}", e))?;
@@ -295,7 +298,10 @@ pub fn decrypt_aes_key<S: DiffieHellman>(
     let shared_secret = recipient_secret_key.diffie_hellman(&ephemeral_public_key);
 
     // 3. Derive the same KEK using the same HKDF parameters.
-    let hk = Hkdf::<Sha256>::new(Some(ephemeral_public_key.as_bytes()), shared_secret.as_bytes());
+    let hk = Hkdf::<Sha256>::new(
+        Some(ephemeral_public_key.as_bytes()),
+        shared_secret.as_bytes(),
+    );
     let mut kek = [0u8; 32];
     hk.expand(b"chiral-network-kek", &mut kek)
         .map_err(|e| format!("HKDF expansion failed: {}", e))?;
